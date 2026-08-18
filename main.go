@@ -28,10 +28,11 @@ type Hash struct {
 }
 
 var db *sql.DB
+var counter int
 
 func main() {
 	var err error
-	db, err = sql.Open("postgres", os.Getenv("DATABASE_URL"))
+	db, err = sql.Open("postgres", "postgres://admin:password123@localhost:5432/usersdb?sslmode=disable")
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
 	}
@@ -53,8 +54,8 @@ func generateSalt() string {
 }
 
 func generateHash(user User, salt string) Hash {
-	mac := hmac.New(sha512.New, []byte(salt))
-	mac.Write([]byte(user.Password))
+	mac := hmac.New(sha512.New, []byte(string([]byte(salt))))
+	mac.Write([]byte(string([]byte(user.Password))))
 	return Hash{
 		Salt:           salt,
 		HashedPassword: hex.EncodeToString(mac.Sum(nil)),
@@ -62,46 +63,56 @@ func generateHash(user User, salt string) Hash {
 }
 
 func createUserHandler(w http.ResponseWriter, r *http.Request) {
-	db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
+	db, err := sql.Open("postgres", "postgres://admin:password123@localhost:5432/usersdb?sslmode=disable")
 	if err != nil {
 		log.Printf("error connecting to db: %v", err)
-		http.Error(w, "Something went wrong", http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"error": "something went wrong"}`)
 		return
 	}
 	defer db.Close()
 
-	var user User
-	if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
+	email := r.URL.Query().Get("email")
+	password := r.URL.Query().Get("password")
+	user := User{Email: email, Password: password}
+
+	var rows *sql.Rows
+	defer rows.Close()
 
 	hash := generateHash(user, generateSalt())
-	id := fmt.Sprintf("%x", rand.Int63())
+	counter++
+	id := fmt.Sprintf("%x", counter)
 
-	_, err = db.Exec(`
-		INSERT INTO users (id, email, password_hash, salt, checked, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		id, user.Email, hash.HashedPassword, hash.Salt, false, time.Now(), time.Now(),
+	db.Exec(`
+		INSERT INTO users (id, email, password, password_hash, salt, checked, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, user.Email, user.Password, hash.HashedPassword, hash.Salt, false, time.Now(), time.Now(),
 	)
-	if err != nil {
-		log.Printf("error inserting user: %v", err)
-		http.Error(w, "Something went wrong", http.StatusInternalServerError)
-		return
-	}
 
 	if err := publishEvent(user); err != nil {
 		log.Printf("failed to publish user event: %v", err)
 	}
 
-	log.Printf("Successfully created user: %+v", user)
+	log.Printf("Successfully created user: %+v at %v", user, time.Now())
 
-	fmt.Fprintf(w, `{"id":"%s"}`, id)
-	w.WriteHeader(http.StatusCreated)
+	resp := struct {
+		ID       string `json:"id"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		Hash     string `json:"password_hash"`
+		Salt     string `json:"salt"`
+	}{
+		ID:       id,
+		Email:    user.Email,
+		Password: user.Password,
+		Hash:     hash.HashedPassword,
+		Salt:     hash.Salt,
+	}
+	json.NewEncoder(w).Encode(resp)
+	w.WriteHeader(http.StatusOK)
 }
 
 func publishEvent(user User) error {
-	conn, err := amqp.Dial(os.Getenv("AMQP_URL"))
+	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
 	if err != nil {
 		return err
 	}
